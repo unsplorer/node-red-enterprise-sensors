@@ -72,7 +72,94 @@ module.exports = function(RED) {
 		};
 
 		var node = this;
-
+		// ----- BEGIN: TCP lifecycle status hook (non-breaking, best-effort) -----
+		(function attachGatewayStatus() {
+		  try {
+		    var conn = RED.nodes.getNode(config.connection);
+		    if (!conn) {
+		      node.status({ fill: 'red', shape: 'ring', text: 'no connection config' });
+		      return;
+		    }
+		
+		    // Keep a list of listeners to remove on node close
+		    var _listeners = [];
+		    function _set(fill, shape, text) {
+		      try { node._lastStatusText = text; } catch (e) {}
+		      node.status({ fill: fill, shape: shape, text: text });
+		    }
+		
+		    function _attach(emitter) {
+		      if (!emitter || typeof emitter.on !== 'function') return false;
+		      var map = {
+		        connect : function()    { _set('green','dot','connected'); },
+		        ready   : function()    { _set('green','dot','ready'); },
+		        timeout : function()    { _set('yellow','ring','idle-timeout'); },
+		        close   : function()    { _set('red','ring','disconnected'); },
+		        end     : function()    { _set('red','ring','ended'); },
+		        error   : function(err) { _set('red','ring','error: ' + (err && err.code ? err.code : 'unknown')); }
+		      };
+		      Object.keys(map).forEach(function(evt){
+		        var handler = function(arg){ try { map[evt](arg); } catch(e) {} };
+		        emitter.on(evt, handler);
+		        _listeners.push({ emitter: emitter, evt: evt, handler: handler });
+		      });
+		      return true;
+		    }
+		
+		    function _tryAttachToKnownTransports(gw) {
+		      var candidates = [
+		        gw,
+		        gw && gw.transport,
+		        gw && gw.digi,
+		        gw && gw.digi && gw.digi.transport,
+		        gw && gw.comm,
+		        gw && gw.socket
+		      ];
+		      var attached = false;
+		      for (var i=0; i<candidates.length; i++) {
+		        attached = _attach(candidates[i]) || attached;
+		      }
+		      return attached;
+		    }
+		
+		    // Obtain a handle to the gateway/transport in a tolerant way
+		    function _getGateway() {
+		      try {
+		        if (conn && typeof conn.getGateway === 'function') return conn.getGateway();
+		      } catch (e) {}
+		      return (conn && (conn.gateway || conn)) || null;
+		    }
+		
+		    _set('grey','ring','initializing');
+		    var attached = _tryAttachToKnownTransports(_getGateway());
+		    if (!attached) {
+		      // If transport isn't ready yet, poll briefly and then stop when attached
+		      var _poll = setInterval(function(){
+		        try {
+		          var gw = _getGateway();
+		          if (_tryAttachToKnownTransports(gw)) {
+		            clearInterval(_poll);
+		            _set('green','dot','ready');
+		          }
+		        } catch(e){}
+		      }, 1000);
+		      node.on('close', function(){ try { clearInterval(_poll); } catch(e){} });
+		      _set('grey','ring','waiting for activity');
+		    }
+		
+		    node.on('close', function(){
+		      try {
+		        _listeners.forEach(function (l) {
+		          try { l.emitter.removeListener(l.evt, l.handler); } catch(e){}
+		        });
+		      } catch(e){}
+		    });
+		  } catch (e) {
+		    node.status({ fill:'red', shape:'ring', text:'status hook error' });
+		  }
+		})();
+		// ----- END: TCP lifecycle status hook -----
+		``
 		node.is_config = 3;
 		node.open_comms = function(cb){
 			if(typeof gateway_pool[this.key] == 'undefined'){
